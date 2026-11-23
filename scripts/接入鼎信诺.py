@@ -802,7 +802,7 @@ def 整理余额(balance, extra, journal, journal_parts, rules, names, chosen):
                     记录(balance,'仅分配序时账已知发生额，期初未分配',base,selected[-1])
                 balance.警示.append((base.位置,'已补入本期辅助项目','项目期末仅列可确认的净变动，未知期初和未归属发生额另列'))
         if not selected:
-            # 科目名已说明的分类仍可直接显示在汇总行，无源辅助维度由共用规则标记。
+            # 由统一写出逻辑识别原行自带的对象，科目行与辅助行分别展示。
             base.辅助指定 = None
             if items or extra is not None:
                 balance.警示.append((base.位置,'缺少所选维度的余额明细','该科目保留汇总，不按其他维度或未知期初拆分'))

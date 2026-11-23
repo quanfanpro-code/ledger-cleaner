@@ -163,6 +163,24 @@ class 复核(unittest.TestCase):
         out = self.跑([f,a])
         self.assertEqual(self.读(out,'序时账')[0][7:10],(60,'P1','甲单位'))
 
+    def test_按辅助栏区分科目时仍能读到全部级次和金额(self):
+        f = self.写('余额',[
+            [*余额,'开户行','银行账号'],
+            ['1001','库存现金','借','否',1,0,120,100,20],
+            ['100101','人民币','借','是',2,0,120,100,20],
+            ['1002','银行存款','借','是',1,3,10,0,13,'甲银行','00008'],
+            ['2221','应交税费','贷','否',1,11,0,2,13],
+            ['222103','未交增值税','贷','是',2,11,0,2,13]])
+        out = self.跑([f])
+        rows = self.读(out,'余额表')
+        by_level = [r for r in rows if r[10] is not None]
+        by_aux = [r for r in rows if not any(r[2:4])]
+        self.assertEqual(by_level,by_aux)
+        self.assertEqual([r[0] for r in by_aux],['1001','100101','1002','2221','222103'])
+        self.assertEqual(by_aux[1][6:8],(120,100))
+        bank = [r for r in rows if r[2]=='00008']
+        self.assertEqual([(r[3],r[4],r[8],r[10]) for r in bank],[('甲银行 00008',3,13,None)])
+
 
 if __name__ == '__main__':
     unittest.main()

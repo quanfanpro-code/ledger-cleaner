@@ -1,6 +1,7 @@
 """把同类账户组合账表转换成借贷两列。"""
 import argparse
 from collections import Counter, defaultdict
+from dataclasses import replace
 from datetime import date
 import json
 from pathlib import Path
@@ -365,6 +366,9 @@ def 辅助规则(books, rules, catalog):
             if bank[1] and 有值(contract):
                 loans[(row.编码[0],contract)].add(bank)
 
+    def 缺项(row,label,reason):
+        return '',('' if row.行类型=='科目汇总' else label),reason
+
     def choose(row):
         if row.辅助指定 is not None:
             return row.辅助指定
@@ -375,9 +379,9 @@ def 辅助规则(books, rules, catalog):
         if source == 'literal':
             return row.编码[3], rule[2], ''
         if source == 'year':
-            return (row.年份,row.年份,'') if row.年份 else ('','会计年度未记录','会计期间无法确认')
+            return (row.年份,row.年份,'') if row.年份 else 缺项(row,'会计年度未记录','会计期间无法确认')
         if source == 'currency':
-            return ('',row.币种,'') if row.币种 else ('','币种未记录','原表缺币种')
+            return ('',row.币种,'') if row.币种 else 缺项(row,'币种未记录','原表缺币种')
         if source == 'loan':
             if not 有值(row.贷款行[1]) and row.往来冲突:
                 raise 输入错误(row.往来冲突)
@@ -394,7 +398,7 @@ def 辅助规则(books, rules, catalog):
                 if 有值(row.贷款行[1]):
                     raise 输入错误(f'{row.位置} 的利息贷款银行与同公司同合同的本金资料冲突。请核对贷款银行和合同编码。')
             if len(names) != 1 or len(codes) > 1:
-                return '', '贷款银行待核', '同公司同合同未唯一匹配贷款银行'
+                return 缺项(row,'贷款银行待核','同公司同合同未唯一匹配贷款银行')
             token = next(iter(codes),'')
             name = min(name for _,name in candidates)
         elif isinstance(source,str) and source.startswith('鼎信诺:'):
@@ -410,7 +414,7 @@ def 辅助规则(books, rules, catalog):
         if source == 7 and (row.编码[6] == '9999' or row.名称.get(7) == '重分类-项目段'):
             return '', '重分类调整', '重分类项目占位单独留痕'
         label = '往来' if source == 8 else ('项目' if source == 7 else dimension)
-        return '', f'{label}未记录', f'{dimension}缺值或同一编码名称有冲突'
+        return 缺项(row,f'{label}未记录',f'{dimension}缺值或同一编码名称有冲突')
     return choose
 
 
@@ -462,11 +466,40 @@ def 余额保留行(book, data, trace):
     return keep
 
 
+def 区分科目与辅助(book,rules,choose):
+    if not any(r.行类型=='科目汇总' for r in book.行):
+        return
+    existing = {(r.编码[0],r.编码[3]) for r in book.行 if r.行类型 in ('辅助明细','未列明辅助项目')}
+    expanded = []
+    if book.源行数 is None:
+        book.源行数 = len(book.行)
+    for row in book.行:
+        expanded.append(row)
+        if row.行类型!='科目汇总':
+            continue
+        key = row.编码[0],row.编码[3]
+        token,name,issue = choose(row)
+        row.辅助指定 = ('','','')
+        if not row.末级 or key in existing or not any(row.金额):
+            continue
+        if issue and not (token or name):
+            book.警示.append((row.位置,'未取得辅助对象',issue))
+            continue
+        # 原科目名称和编码已在前两列展示，不再复制成一个辅助对象。
+        repeats_subject = (rules[key[1]][1]=='literal' and token==key[1]
+                           and 规范(name)==规范(row.名称.get(4)))
+        if (token or name) and not repeats_subject:
+            expanded.append(replace(row,行类型='辅助明细',科目级次=None,辅助指定=(token,name,issue)))
+    book.行 = expanded
+
+
 def 准备输出(books, rules, names, choose, roots):
     results, traces, checks, warnings = {}, {}, [], []
     movements, bank_accounts = {}, {}
     for book in books:
         kind = book.类别
+        if kind=='余额表':
+            区分科目与辅助(book,rules,choose)
         data = []
         trace = []
         amounts = {}
@@ -494,7 +527,7 @@ def 准备输出(books, rules, names, choose, roots):
                 remainder = tuple(value-used for value,used in zip(movement,allocated,strict=True))
                 if any(remainder):
                     destinations.append(((company,code,'','未列明辅助项目'),by_aux,remainder))
-            elif row.行类型 != '科目汇总' or (book.补充核对 is None and row.末级):
+            elif row.行类型 != '科目汇总':
                 destinations.append((aux_key,by_aux,movement))
             for key,destination,part in destinations:
                 for i,value in enumerate(part):
@@ -634,13 +667,17 @@ def _write_book(path, sheets, precision):
                 sheet.autofilter(0,0,len(rows),len(columns)-1)
 
 
-def _verify_output(path, kind, expected, precision):
+def _verify_output(path, kind, expected, precision, source):
     from datetime import datetime
     book = load_workbook(path,read_only=True,data_only=True)
     try:
         iterator = book[kind].iter_rows(max_col=len(表头[kind]), values_only=True)
         if list(next(iterator)) != 表头[kind]:
             raise 输入错误(f'{kind} 保存后表头复核失败。')
+        # 从原科目取数，用导入方看的辅助栏识别成品科目，独立于写表时生成的行。
+        accounts = None
+        if kind=='余额表' and any(row.行类型=='科目汇总' for row in source.行):
+            accounts = iter((r.编码[3],r.科目级次,r.金额) for r in source.行 if r.行类型=='科目汇总' and any(r.金额))
         count = 0
         for index,(got,wanted) in enumerate(zip(iterator,expected,strict=True),2):
             actual = list(got)
@@ -648,11 +685,17 @@ def _verify_output(path, kind, expected, precision):
                 actual[col] = 金额(actual[col],位置(path.name,kind,index),col,precision)
             if kind == '序时账' and isinstance(actual[0],datetime):
                 actual[0] = actual[0].date()
+            if accounts is not None and not any(actual[2:4]):
+                values = tuple(actual[col] for col in 金额列[kind])
+                if any(values) and next(accounts,None)!=(actual[0],actual[10],values):
+                    raise 输入错误(f'余额表第{index}行按科目导入后，编码、级次或金额与原表不符。')
             if tuple(actual) != wanted:
                 raise 输入错误(f'{kind} 保存后第{index}行回读结果有变化。')
             count += 1
         if count != len(expected):
             raise 输入错误(f'{kind} 保存后条数复核失败。')
+        if accounts is not None and next(accounts,None) is not None:
+            raise 输入错误('余额表按辅助栏区分科目后有非零原科目漏读，停止交付。')
     except ValueError as exc:
         raise 输入错误(f'{kind} 保存后回读校验失败：{exc}') from exc
     finally:
@@ -670,7 +713,8 @@ def 写结果(args, books, supplements, rules, names, prepared):
         for kind,data in results.items():
             widths = [14,14,20,48,16,35,17,17,22,37,17,25] if kind == '序时账' else [16,43,22,40,18,18,19,19,18,18,23]
             _write_book(stage/表名[kind],[(kind,表头[kind],data,金额列[kind],widths)],precision)
-            _verify_output(stage/表名[kind],kind,data,precision)
+            source = next(book for book in books if book.类别==kind)
+            _verify_output(stage/表名[kind],kind,data,precision,source)
         sources = [*books,*supplements.values()]
         overview = [(b.类别,b.文件,b.页,b.表头,b.期间 or '未识别',
                      b.源行数 if b.源行数 is not None else len(b.行),
