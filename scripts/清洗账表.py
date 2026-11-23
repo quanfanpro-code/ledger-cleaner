@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 表头 = {
     '序时账': ['日期','凭证类型','凭证号','摘要','科目编码','科目名称','借方金额','贷方金额','辅助核算编码','辅助核算名称','一级编码','一级科目'],
     '余额表': ['科目编码','科目名称','辅助核算编码','辅助核算名称',
-             '期初余额(借方)','期初余额(贷方)','累计发生额(借方)','累计发生额(贷方)','期末余额(借方)','期末余额(贷方)','行类型'],
+             '期初余额(借方)','期初余额(贷方)','累计发生额(借方)','累计发生额(贷方)','期末余额(借方)','期末余额(贷方)','科目级次'],
 }
 原金额 = {'序时账': ('借方发生额','贷方发生额'), '余额表': ('期初净额','借方发生额','贷方发生额','期末净额')}
 金额列 = {'序时账': (6,7), '余额表': (4,6,7,8)}
@@ -308,7 +308,7 @@ def 账户规则(books, exact, overrides, roots, dimensions):
                 basis = '鼎信诺科目与源维度'
         if not rule and code in ding and code not in detail:
             rule = ('上级科目','literal',source_title)
-            basis = '上级科目在核对表留存'
+            basis = '保留原表科目级次'
         if not rule:
             listed = '、'.join(sorted(dimensions.get(code,())))
             suffix = f' 源表候选：{listed}。' if listed else ''
@@ -453,6 +453,7 @@ def 准备输出(books, rules, names, choose, roots):
         banks = defaultdict(lambda:defaultdict(set))
         vouchers = defaultdict(int)
         balance_layers = defaultdict(list)
+        leaf_rows = []
         for position, row in enumerate(book.行):
             company, code = row.编码[0], row.编码[3]
             aux, aux_name, issue = choose(row)
@@ -461,7 +462,7 @@ def 准备输出(books, rules, names, choose, roots):
             movement = row.金额 if kind == '序时账' else row.金额[1:3]
             aux_key = (company,code,aux,aux_name)
             destinations = []
-            if not row.行类型 or row.行类型 == '科目汇总':
+            if not row.行类型 or (row.行类型 == '科目汇总' and row.末级):
                 destinations.append(((company,code),by_subject,movement))
             if row.辅助分项:
                 for object_code,object_name,part in row.辅助分项:
@@ -491,17 +492,17 @@ def 准备输出(books, rules, names, choose, roots):
                 output_row = len(data)+1
             elif row.行类型:
                 o,d,c,e = row.金额
-                data.append((code,names[code],aux or None,aux_name or None,o,None,d,c,e,None,row.行类型))
+                level = row.科目级次 if row.行类型 == '科目汇总' else None
+                data.append((code,names[code],aux or None,aux_name or None,o,None,d,c,e,None,level))
+                if row.行类型 == '科目汇总' and row.末级:
+                    leaf_rows.append(data[-1])
                 output_row = len(data)+1
                 balance_layers[(company,code)].append((row.行类型,row.金额))
             else:
-                key = (company,code,aux,aux_name) if aux else (company,code,position)
+                key = (company,code,aux,aux_name,row.科目级次) if aux else (company,code,position)
                 if key not in amounts:
                     amounts[key] = [0,0,0,0]
-                    label = '辅助明细' if aux or not issue and aux_name else '未列明辅助项目'
-                    if aux_name and issue.endswith('只有名称，按原行保留'):
-                        label = '辅助明细'
-                    group_keys[key] = (len(amounts)+1,code,names[code],aux or None,aux_name,label)
+                    group_keys[key] = (len(amounts)+1,code,names[code],aux or None,aux_name,row.科目级次)
                 for i,value in enumerate(row.金额):
                     amounts[key][i] += value
                 output_row = group_keys[key][0]
@@ -514,8 +515,8 @@ def 准备输出(books, rules, names, choose, roots):
                 if len(layer) > 1 and layer[0][1] != 向量合计((amount for _,amount in layer[1:]),4):
                     raise 输入错误(f'科目 {code} 的辅助明细与未列明项目无法对回科目汇总。')
             for key,(o,d,c,e) in amounts.items():
-                _,code,name,aux,aux_name,label = group_keys[key]
-                data.append((code,name,aux,aux_name,o,None,d,c,e,None,label))
+                _,code,name,aux,aux_name,level = group_keys[key]
+                data.append((code,name,aux,aux_name,o,None,d,c,e,None,level))
         else:
             if any(vouchers.values()):
                 bad_vouchers = sum(v != 0 for v in vouchers.values())
@@ -526,7 +527,7 @@ def 准备输出(books, rules, names, choose, roots):
         size = len(原金额[kind])
         controlled = book.控制合计 is not None
         source_total = book.控制合计 if controlled else 向量合计((r.金额 for r in book.行),size)
-        output_total = 向量合计((tuple(r[i] for i in 金额列[kind]) for r in data if not controlled or r[-1] == '科目汇总'),size)
+        output_total = 向量合计((tuple(r[i] for i in 金额列[kind]) for r in (leaf_rows if controlled else data)),size)
         if source_total != output_total:
             raise 输入错误(f'{kind} 清洗前后金额不一致，停止交付。')
         for field,a,b in zip(原金额[kind],source_total,output_total):

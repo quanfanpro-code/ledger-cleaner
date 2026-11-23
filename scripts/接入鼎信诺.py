@@ -12,7 +12,7 @@ from openpyxl.utils.datetime import WINDOWS_EPOCH
 from openpyxl.utils.cell import get_column_letter
 
 from 读取账表 import (
-    位置, 展开表头, 工作表部件, 日期, 有值, 标识, 规范, 表, 表头公司, 表头期间,
+    位置, 展开表头, 工作表部件, 日期, 有值, 标识, 规范, 表, 表头公司, 表头期间, 解析科目级次,
     行, 读取布局, 输入错误, 金额, 文本,
 )
 
@@ -237,7 +237,31 @@ def 读鼎信诺(path, forced, limit, precision):
         if len(candidates) > 1:
             pages = '、'.join(item[0] for item in candidates)
             raise 输入错误(f'{path.name} 有多个可读取的鼎信诺工作表：{pages}。请指定工作表或分开提交。')
-        return 转换源表(path, *candidates[0], precision)
+        book = 转换源表(path, *candidates[0], precision)
+        if book.类别 == '余额表' and '级次' not in book.字段 and '合并辅助' in book.字段:
+            for title, _, rows, _, _ in sheets:
+                if title == '核对明细':
+                    读取旧表级次(book,rows)
+                    break
+        return book
+
+
+def 读取旧表级次(book, rows):
+    iterator = iter(rows())
+    header = [规范(cell.value) for cell in next(iterator,())]
+    if not {'主表行号','科目级次'} <= set(header):
+        return
+    row_col,level_col = (header.index(field) for field in ('主表行号','科目级次'))
+    controls = {row.位置.行:row for row in book.行 if not row.辅助记录}
+    for number,cells in enumerate(iterator,2):
+        if level_col >= len(cells) or not 文本(cells[level_col].value):
+            continue
+        pos = 位置(book.文件,'核对明细',number)
+        reference = 标识(cells[row_col],pos) if row_col < len(cells) else ''
+        row = controls.get(int(reference)) if reference.isdecimal() else None
+        if row is None or row.科目级次 is not None:
+            raise 输入错误(f'{pos} 的科目级次无法唯一对应原科目行。')
+        row.科目级次 = 解析科目级次(标识(cells[level_col],pos),pos)
 
 
 def 转换源表(path, title, rows, raw, formulas, merges, epoch, hit, precision):
@@ -364,8 +388,9 @@ def 转换源表(path, title, rows, raw, formulas, merges, epoch, hit, precision
             if leaf and leaf not in ('是','否','1','0','true','false','yes','no','y','n'):
                 raise 输入错误(f'{pos} 无法识别是否明细科目。')
             row.末级 = leaf not in ('否','0','false','no','n')
-            # 导出的空辅助表可以参与同批核对，主表的一级行保留本身名称。
-            if identifier('级次') == '1' or re.fullmatch(r'\d{4}', code):
+            if not is_aux and not row.辅助记录:
+                row.科目级次 = 解析科目级次(identifier('级次'),pos)
+            if row.科目级次 == 1 or (row.科目级次 is None and re.fullmatch(r'\d{4}',code)):
                 row.一级编码, row.一级科目 = code, name
             row.行类型 = '辅助明细' if row.辅助记录 else '科目汇总'
             row.年份 = period[:4] if period and period[:4] == period[8:12] else ''
@@ -534,31 +559,35 @@ def 分组余额(book, extra):
 
 
 def 标记上级(rows):
-    ordered = sorted({(r.编码[0],r.编码[3]) for r in rows if not r.辅助记录 and r.编码[3].isdecimal()})
-    parents = {(owner,parent) for (owner,parent),(company,child) in zip(ordered,ordered[1:])
-               if owner == company and child.startswith(parent)}
-    for row in rows:
-        if (row.编码[0],row.编码[3]) in parents:
-            row.末级 = False
+    controls = {(row.编码[0],row.编码[3]):row for row in rows if not row.辅助记录}
+    for key in 直接下级(controls):
+        controls[key].末级 = False
+
+
+def 直接下级(controls):
+    children = defaultdict(list)
+    for (company,code),row in controls.items():
+        for end in range(len(code)-1,0,-1):
+            if not code.isdecimal() and code[end] not in '.-':
+                continue
+            key = company,code[:end]
+            parent = controls.get(key)
+            if parent is None:
+                continue
+            if row.科目级次 is not None and parent.科目级次 is not None and parent.科目级次 != row.科目级次-1:
+                continue
+            children[key].append(row)
+            break
+    return children
 
 
 def 核对上级(book, controls):
-    parents = {key:row for key,row in controls.items() if not row.末级}
-    by_parent = defaultdict(list)
-    for (company,code),row in controls.items():
-        if not row.末级:
-            continue
-        for i in range(1,len(code)):
-            if not code.isdecimal() and code[i] not in '.-':
-                continue
-            key = company,code[:i]
-            if key in parents:
-                by_parent[key].append(row)
-    for key,parent in parents.items():
-        children = by_parent[key]
-        if not children:
-            book.警示.append((parent.位置,'上级科目没有可核实的下级','原科目金额单独记录于辅助匹配，请检查是否仅导出上级范围'))
-        elif 汇总(children,4) != parent.金额:
+    by_parent = 直接下级(controls)
+    for key,parent in controls.items():
+        children = by_parent.get(key,())
+        if not children and not parent.末级:
+            book.警示.append((parent.位置,'上级科目没有可核实的下级','余额表保留该科目的原金额，请检查源表范围'))
+        elif children and 汇总(children,4) != parent.金额:
             book.警示.append((parent.位置,'上级金额与下级汇总不同','两层金额分别留存，请核对源表的科目与期间范围'))
 
 
@@ -638,12 +667,11 @@ def 整理余额(balance, extra, journal, journal_parts, rules, names):
     balance.控制合计 = 汇总((row for row in controls.values() if row.末级),4)
     for key,base in controls.items():
         rule = rules[key[1]]
-        if not base.末级:
-            记录(balance,'上级科目展示',base,base)
-            continue
         base.辅助指定 = '','',''
         output.append(base)
         记录(balance,'科目汇总',base,base)
+        if not base.末级:
+            continue
         items = details.get(key,[])
         selected = []
         for item in items:

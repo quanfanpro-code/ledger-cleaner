@@ -36,6 +36,7 @@ def 有值(value):
     '组合': '账户组合|账户组合编码|账户编码组合|会计账户组合|账户编号|账户编码|科目组合|账户组合编号|account combination|code combination|account number',
     '描述': '账户描述|账户说明|账户名称|组合说明|组合描述|账户组合描述|account description|combination description',
     '科目编码': '科目|科目编码|会计科目|会计科目编码|科目编号|科目段编码|natural account',
+    '科目级次': '科目级次|科目级别|科目层级|account level',
     '科目名称': '科目段|科目名称|会计科目名称|科目说明|natural account description',
     '一级编码': '一级编码|一级科目编码|一级科目编号',
     '一级科目': '一级科目|一级科目名称|一级科目说明',
@@ -126,6 +127,7 @@ class 行:
     辅助指定: tuple | None = None
     行类型: str = ''
     末级: bool = True
+    科目级次: int | None = None
     鼎信诺键: tuple = ()
     借贷方向: str = ''
     辅助记录: tuple = ()
@@ -506,6 +508,15 @@ def 标识(cell, loc):
     return 文本(value)
 
 
+def 解析科目级次(value, loc):
+    if not 文本(value):
+        return None
+    match = re.fullmatch(r'(?:第)?([0-9]+)(?:级)?',unicodedata.normalize('NFKC',文本(value)))
+    if not match or len(match[1]) > 6:
+        raise 输入错误(f'{loc} 科目级次「{文本(value)}」无法识别，请核对原表。')
+    return int(match[1])
+
+
 def 分列往来(title, val, identifier, position):
     direct = (identifier('往来编码'),文本(val('往来')))
     groups = (('个人',('职工','职员','员工','个人')),
@@ -735,6 +746,7 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
             row.一级科目 = 文本(val('一级科目'))
         else:
             row.年份 = period[:4] if period and period[:4] == period.split('~')[1][:4] else ''
+            row.科目级次 = 解析科目级次(identifier('科目级次'),pos)
         rows.append(row)
     if not rows:
         raise 输入错误(f'{path.name} / {sheet.title} 找到表头，但没有可转换的账户明细。')
