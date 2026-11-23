@@ -1,4 +1,5 @@
 from pathlib import Path
+import csv
 import json
 import subprocess
 import sys
@@ -100,13 +101,18 @@ class 清洗行为(unittest.TestCase):
         journal = self.load_rows(result / '序时账-借贷两列.xlsx', '序时账')
         balance = self.load_rows(result / '余额表-借贷两列.xlsx', '余额表')
         self.assertEqual(len(journal), 5)
+        self.assertEqual(journal[0], ('日期','凭证类型','凭证号','摘要','科目编码','科目名称','借方金额','贷方金额',
+                                      '辅助核算编码','辅助核算名称','一级编码','一级科目'))
+        self.assertEqual(journal[3][-2:], ('1002','银行存款'))
         self.assertEqual([r[8:10] for r in journal[1:3]], [('S03','示例银行城东支行')]*2)
         self.assertEqual(journal[1][2], '000001')
         self.assertEqual(journal[3][6:10], (-10,0,'00005','示例银行城东支行00001234'))
         self.assertEqual(journal[4][9], '往来未记录')
         self.assertEqual(len(balance), 4)
         self.assertEqual(balance[1][2:4], ('00005','示例银行城东支行00001234'))
-        self.assertEqual(balance[1][5:11], (60,None,-10,0,50,None))
+        self.assertEqual(balance[0], ('科目编码','科目名称','辅助核算编码','辅助核算名称','期初余额(借方)','期初余额(贷方)',
+                                      '累计发生额(借方)','累计发生额(贷方)','期末余额(借方)','期末余额(贷方)','行类型'))
+        self.assertEqual(balance[1][4:], (60,None,-10,0,50,None,'辅助明细'))
         self.assertEqual(balance[2][2:4], ('S03','示例银行城东支行'))
         self.assertTrue((result / '清洗核对.xlsx').is_file())
 
@@ -193,7 +199,7 @@ class 清洗行为(unittest.TestCase):
         rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
         self.assertEqual(len(rows),3)
         self.assertEqual(rows[1][2:4],('S01','甲供应商'))
-        self.assertEqual(rows[1][7:10],(120,20,100))
+        self.assertEqual(rows[1][6:9],(120,20,100))
         self.assertEqual(rows[2][2:4],(None,'甲供应商'))
         audit = self.load_rows(result/'清洗核对.xlsx','字段定位')
         self.assertIn(('余额表',self.balance.name,'区间汇总','科目编码','B','版式方案'),audit)
@@ -240,6 +246,84 @@ class 清洗行为(unittest.TestCase):
         rows = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
         self.assertEqual(rows[1][8:10],('B01','示例银行城东支行'))
         self.assertEqual(rows[2][8:10],(None,'贷款银行待核'))
+
+    def make_ding(self, empty_balance=False):
+        journal = ['记账时间','凭证编号','凭证种类','编号','业务说明','科目编号','科目名称','借方发生额','贷方发生额']
+        balance = ['科目编号','科目名称','借贷方向','是否明细科目','科目级次','账面期初数','账面借方发生额','账面贷方发生额','账面期末数']
+        aux = ['核算项目类型名称','核算项目编号','核算项目名称']
+        credit = ['2025-01-05','0007','记','02','材料货款','220201','应付账款-货款',0,100]
+        table_rows = [
+            [journal, ['2025-01-05','0007','记','01','材料货款','1002','银行存款',100,0], credit],
+            [journal+aux,
+             [*credit[:-1],60,'供应商','0001','甲供应商'], [*credit[:-1],40,'供应商','0002','乙供应商'],
+             [*credit,'部门','001','采购部']],
+            [balance, ['2202','应付账款','贷','否',1,25,0,100,125],
+             ['1002','银行存款','借','是',1,5,100,0,105],
+             ['220201','应付账款-货款','贷','是',2,25,0,100,125]],
+            [balance+aux,
+             ['220201','应付账款-货款','贷','是',2,5,0,60,65,'供应商','0001','甲供应商'],
+             ['220201','应付账款-货款','贷','是',2,10,0,40,50,'供应商','0002','乙供应商'],
+             ['220201','应付账款-货款','贷','是',2,25,0,100,125,'部门','001','采购部']],
+        ]
+        if empty_balance:
+            table_rows[2].insert(0,['2025年1月至1月'])
+            table_rows[3] = [['2025年1月至1月'], table_rows[3][0]]
+        paths = [self.work / f'随机文件{i}.xls' for i in range(4)]
+        for path, rows in zip(paths, table_rows, strict=True):
+            with path.open('w', encoding='gb18030', newline='') as file:
+                csv.writer(file, delimiter='\t').writerows(rows)
+        return paths
+
+    def test_鼎信诺四表按内容识别维度及金额层级(self):
+        paths = self.make_ding()
+        result = self.run_skill(files=paths[::-1])
+        journal = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
+        balance = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertEqual(len(journal), 3)
+        self.assertEqual(journal[2][8:12], ('0001；0002','甲供应商；乙供应商','2202','应付账款'))
+        self.assertIn(('220201','应付账款-货款','0001','甲供应商',-5,None,0,60,-65,None,'辅助明细'), balance)
+        self.assertIn(('220201','应付账款-货款',None,'未列明辅助项目',-10,None,0,0,-10,None,'未列明辅助项目'), balance)
+        audit = self.load_rows(result/'清洗核对.xlsx','辅助匹配')
+        self.assertTrue(any('采购部' in row for row in audit))
+        self.assertTrue(any('甲供应商' in row and 60 in row for row in audit))
+        check = self.load_rows(result/'清洗核对.xlsx','金额核对')
+        self.assertTrue(any(row[:5] == ('余额表','贷方发生额',100,100,0) for row in check[1:]))
+        self.assertFalse(any(row[0] == '2202' for row in balance[1:]))
+
+    def test_鼎信诺重复候选时禁止猜测分录归属(self):
+        paths = self.make_ding()
+        with paths[0].open('a', encoding='gb18030', newline='') as f:
+            csv.writer(f, delimiter='\t').writerow(
+                ['2025-01-05','0007','记','02','材料货款','220201','应付账款-货款',0,100])
+        failure = self.run_skill(False, paths)
+        self.assertIn('无法唯一匹配', failure)
+
+    def test_鼎信诺空辅助余额只恢复已知发生额(self):
+        result = self.run_skill(files=self.make_ding(empty_balance=True),optional=('--公司标识','模拟公司'))
+        rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertIn(('220201','应付账款-货款','0001','甲供应商',0,None,0,60,-60,None,'辅助明细'),rows)
+        self.assertIn(('220201','应付账款-货款',None,'未列明辅助项目',-25,None,0,0,-25,None,'未列明辅助项目'),rows)
+        logs = self.load_rows(result/'清洗核对.xlsx','辅助匹配')
+        self.assertTrue(any(row[0] == '仅分配序时账已知发生额，期初未分配' for row in logs))
+
+    def test_鼎信诺新版工作簿用合并表头辨认本位币(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(['示例报表'])
+        titles = ['记账时间','凭证编号','凭证种类','业务说明','科目编号','科目名称']
+        sheet.append([*titles,'原币',None,'本位币',None])
+        sheet.append([None]*6+['借方金额','贷方金额','借方金额','贷方金额'])
+        for col in range(1,7):
+            sheet.merge_cells(start_row=2,start_column=col,end_row=3,end_column=col)
+        sheet.merge_cells('G2:H2')
+        sheet.merge_cells('I2:J2')
+        sheet.append(['2025-01-05','0007','记','银行转款','1002','银行存款',999,0,100,0])
+        sheet.append(['2025-01-05','0007','记','银行转款','2202','应付账款',0,999,0,100])
+        path = self.work/'随便命名的新版导出.xlsx'
+        book.save(path)
+        result = self.run_skill(files=[path])
+        rows = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
+        self.assertEqual([row[6:8] for row in rows[1:]],[(100,0),(0,100)])
 
     def test_不接受与原表冲突的版式方案(self):
         book = Workbook()

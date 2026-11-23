@@ -37,6 +37,8 @@ def 有值(value):
     '描述': '账户描述|账户说明|账户名称|组合说明|组合描述|账户组合描述|account description|combination description',
     '科目编码': '科目|科目编码|会计科目|会计科目编码|科目编号|科目段编码|natural account',
     '科目名称': '科目段|科目名称|会计科目名称|科目说明|natural account description',
+    '一级编码': '一级编码|一级科目编码|一级科目编号',
+    '一级科目': '一级科目|一级科目名称|一级科目说明',
     '日期': '有效日期|记账日期|凭证日期|会计日期|业务日期|日期|effective date|accounting date|journal date',
     '凭证号': '凭证号|凭证号码|凭证编号|凭证序号|journal number|voucher number',
     '摘要': '行摘要|分录摘要|摘要|分录说明|凭证摘要|line description|journal line description',
@@ -119,6 +121,16 @@ class 行:
     合同: str = ''
     往来冲突: str = ''
     银行账号: str = ''
+    一级编码: str = ''
+    一级科目: str = ''
+    辅助指定: tuple | None = None
+    行类型: str = ''
+    末级: bool = True
+    鼎信诺键: tuple = ()
+    借贷方向: str = ''
+    辅助记录: tuple = ()
+    辅助分项: tuple = ()
+    币种: str = ''
 
 
 @dataclass
@@ -133,6 +145,9 @@ class 表:
     期间: str
     警示: list
     识别方式: str
+    补充核对: list | None = None
+    源行数: int | None = None
+    控制合计: tuple | None = None
 
 
 def 工作表部件(path):
@@ -530,6 +545,19 @@ def 表头公司(raw):
     return next(iter(candidates)) if len(candidates) == 1 else ''
 
 
+def 表头期间(top_text):
+    for pattern in (
+        r'((?:19|20)\d{2})年\s*(\d{1,2})月?\s*(?:至|到|[-—~～])\s*(?:((?:19|20)\d{2})年)?\s*(\d{1,2})月',
+        r'((?:19|20)\d{2})[-/年](\d{1,2})月?\s*(?:至|到|[~～])\s*((?:19|20)\d{2})[-/年](\d{1,2})',
+    ):
+        match = re.search(pattern, top_text)
+        if match:
+            a,b,c,d = match.groups()
+            if 1 <= int(b) <= 12 and 1 <= int(d) <= 12:
+                return f'{a}-{int(b):02d}~{c or a}-{int(d):02d}'
+    return ''
+
+
 def 分列数据(val, identifier, columns, company, position):
     parts = ['0']*10
     names = {segment:文本(val(field)) for field,segment in 名称段位.items() if 有值(val(field))}
@@ -618,17 +646,7 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
                               for key in used_amounts if columns[key] < len(row))
     if re.search(r'单位\s*[:：]?\s*(?:人民币\s*)?[万千百]元', top_text) or re.search(r'[万千百]元', amount_headers):
         raise 输入错误(f'{path.name} / {sheet.title} 的报表金额单位不是元，请确认如何换算后再处理。')
-    period = ''
-    if kind == '余额表':
-        match = re.search(r'((?:19|20)\d{2})年\s*(\d{1,2})月?\s*(?:至|到|[-—~～])\s*(?:((?:19|20)\d{2})年)?\s*(\d{1,2})月', top_text)
-        if match:
-            a, b, c, d = match.groups()
-            period = f'{a}-{int(b):02d}~{c or a}-{int(d):02d}'
-        else:
-            match = re.search(r'((?:19|20)\d{2})[-/年](\d{1,2})月?\s*(?:至|到|[~～])\s*((?:19|20)\d{2})[-/年](\d{1,2})', top_text)
-            if match:
-                a,b,c,d = match.groups()
-                period = f'{a}-{int(b):02d}~{c}-{int(d):02d}'
+    period = 表头期间(top_text) if kind == '余额表' else ''
     plan_period = layout.get('会计期间','')
     if period and plan_period and period != plan_period:
         raise 输入错误(f'{path.name} / {sheet.title} 的表头会计期间与版式方案不一致。')
@@ -713,6 +731,8 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
             row.期间 = 文本(val('期间')) or row.日期.strftime('%Y-%m')
             row.年份 = str(row.日期.year)
             row.行号 = 文本(val('行号'))
+            row.一级编码 = identifier('一级编码')
+            row.一级科目 = 文本(val('一级科目'))
         else:
             row.年份 = period[:4] if period and period[:4] == period.split('~')[1][:4] else ''
         rows.append(row)
