@@ -17,8 +17,8 @@ try:
 except ImportError as exc:
     raise SystemExit('缺少 Excel 读写组件。请由 Agent 按技能中的安装说明补齐后再运行。') from exc
 
-from 读取账表 import 输入错误, 字段, 规范, 文本, 有值, 读表, 查看结构, 金额, 位置
-from 接入鼎信诺 import 辅助表, 核对列, 应用辅助, 标记上级, 查看旧表, 维度资料, 维度来源, 读鼎信诺
+from 读取账表 import 输入错误, 字段, 规范, 文本, 有值, 读表, 查看结构, 金额, 位置, 核实分录日期
+from 接入鼎信诺 import 辅助表, 核对列, 应用辅助, 标记上级, 查看旧表, 直接下级, 维度资料, 维度来源, 读鼎信诺, 核对上级, 汇总
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +44,7 @@ def 准备参数():
     p.add_argument('--余额表工作表')
     p.add_argument('--公司标识', help='账套未标注时使用已经确认的本批公司标识')
     p.add_argument('--余额期间', help='鼎信诺余额表未标注期间时，使用已核实的起止月份，例如 2025-01~2025-12')
+    p.add_argument('--序时期间', help='序时账未标注期间时，使用已核实的起止月份')
     p.add_argument('--输出目录', type=Path)
     p.add_argument('--预检', action='store_true', help='识别、对账并报告歧义，不生成结果文件')
     p.add_argument('--科目规则', type=Path, help='用户确认后的额外科目规则文件')
@@ -161,7 +162,7 @@ def 载入版式(file, input_names):
             raise 输入错误(f'{name} 的公司标识需要填写来自原表的实际标识。')
         if '会计期间' in entry:
             period = entry['会计期间']
-            if (kind != '余额表' or not isinstance(period,str) or
+            if (not isinstance(period,str) or
                 not 期间格式.fullmatch(period) or period[:7] > period[8:]):
                 raise 输入错误(f'{name} 的余额表期间需要填写起止月份，例如 2025-01~2025-12。')
         result[name] = {**entry,'列':columns}
@@ -369,6 +370,8 @@ def 辅助规则(books, rules, catalog):
             return row.辅助指定
         rule = rules[row.编码[3]]
         dimension, source = rule[:2]
+        if (source in (5,9) or '银行账户' in dimension or dimension=='结算账户') and 有值(row.银行账号):
+            return row.银行账号,row.名称.get(5) or row.银行账号,''
         if source == 'literal':
             return row.编码[3], rule[2], ''
         if source == 'year':
@@ -439,6 +442,26 @@ def 银行跨表对应(journal_aux, balance_aux, journal_accounts, balance_accou
     return links
 
 
+def 余额保留行(book, data, trace):
+    keep = {number for number,values in enumerate(data,2)
+            if any(values[col] for col in 金额列['余额表'])}
+    if not keep or len(keep) == len(data):
+        return keep
+    scopes = {item[-1]:(item[4],item[5]) for item in trace}
+    account_rows = {item[-1]:row for row,item in zip(book.行,trace,strict=True)
+                    if row.行类型 == '科目汇总' or (not row.行类型 and row.科目级次 is not None)}
+    controls = {scopes[number]:row for number,row in account_rows.items()}
+    parents = {(child.编码[0],child.编码[3]):key
+               for key,children in 直接下级(controls).items() for child in children}
+    needed = {scopes[number] for number in keep}
+    for key in tuple(needed):
+        while key in parents and parents[key] not in needed:
+            key = parents[key]
+            needed.add(key)
+    keep.update(number for number in account_rows if scopes[number] in needed)
+    return keep
+
+
 def 准备输出(books, rules, names, choose, roots):
     results, traces, checks, warnings = {}, {}, [], []
     movements, bank_accounts = {}, {}
@@ -453,7 +476,7 @@ def 准备输出(books, rules, names, choose, roots):
         banks = defaultdict(lambda:defaultdict(set))
         vouchers = defaultdict(int)
         balance_layers = defaultdict(list)
-        leaf_rows = []
+        leaf_rows = set()
         for position, row in enumerate(book.行):
             company, code = row.编码[0], row.编码[3]
             aux, aux_name, issue = choose(row)
@@ -471,7 +494,7 @@ def 准备输出(books, rules, names, choose, roots):
                 remainder = tuple(value-used for value,used in zip(movement,allocated,strict=True))
                 if any(remainder):
                     destinations.append(((company,code,'','未列明辅助项目'),by_aux,remainder))
-            elif row.行类型 != '科目汇总':
+            elif row.行类型 != '科目汇总' or (book.补充核对 is None and row.末级):
                 destinations.append((aux_key,by_aux,movement))
             for key,destination,part in destinations:
                 for i,value in enumerate(part):
@@ -487,17 +510,18 @@ def 准备输出(books, rules, names, choose, roots):
                 first_name = row.一级科目 or roots.get(first_code)
                 if not first_name:
                     warnings.append((kind,str(row.位置),code,'源表未提供可确认的一级科目名称'))
-                data.append((row.日期,row.类型 or None,row.凭证,row.摘要 or None,code,names[code],*row.金额,
+                data.append((row.日期,row.类型 or None,row.凭证,row.摘要 or None,code,row.名称.get(4) or names[code],*row.金额,
                              aux or None,aux_name,first_code or None,first_name))
                 output_row = len(data)+1
             elif row.行类型:
                 o,d,c,e = row.金额
                 level = row.科目级次 if row.行类型 == '科目汇总' else None
                 data.append((code,names[code],aux or None,aux_name or None,o,None,d,c,e,None,level))
-                if row.行类型 == '科目汇总' and row.末级:
-                    leaf_rows.append(data[-1])
                 output_row = len(data)+1
-                balance_layers[(company,code)].append((row.行类型,row.金额))
+                if row.行类型 == '科目汇总' and row.末级:
+                    leaf_rows.add(output_row)
+                if book.补充核对 is not None:
+                    balance_layers[(company,code)].append((row.行类型,row.金额))
             else:
                 key = (company,code,aux,aux_name,row.科目级次) if aux else (company,code,position)
                 if key not in amounts:
@@ -517,7 +541,21 @@ def 准备输出(books, rules, names, choose, roots):
             for key,(o,d,c,e) in amounts.items():
                 _,code,name,aux,aux_name,level = group_keys[key]
                 data.append((code,name,aux,aux_name,o,None,d,c,e,None,level))
+            keep = 余额保留行(book,data,trace)
+            additional_trace = []
+            for row,item in zip(book.行,trace,strict=True):
+                for source in row.来源位置[1:]:
+                    additional_trace.append((source.文件,source.页,source.行,*item[3:]))
+            trace.extend(additional_trace)
+            kept_rows = [(number,row) for number,row in enumerate(data,2) if number in keep]
+            if len(kept_rows) != len(data):
+                # 结果行号按筛选后重排，未出表的源行仍有来源记录。
+                result_numbers = {old:new for new,(old,_) in enumerate(kept_rows,2)}
+                trace = [(*item[:-1],result_numbers.get(item[-1])) for item in trace]
+            data = [row for _,row in kept_rows]
+            check_rows = [row for number,row in kept_rows if number in leaf_rows] if book.控制合计 is not None else data
         else:
+            check_rows = data
             if any(vouchers.values()):
                 bad_vouchers = sum(v != 0 for v in vouchers.values())
                 warnings.append((kind,book.文件,'',f'{bad_vouchers} 个凭证分组借贷发生额不同，原分录已保留'))
@@ -527,13 +565,13 @@ def 准备输出(books, rules, names, choose, roots):
         size = len(原金额[kind])
         controlled = book.控制合计 is not None
         source_total = book.控制合计 if controlled else 向量合计((r.金额 for r in book.行),size)
-        output_total = 向量合计((tuple(r[i] for i in 金额列[kind]) for r in (leaf_rows if controlled else data)),size)
+        output_total = 向量合计((tuple(r[i] for i in 金额列[kind]) for r in check_rows),size)
         if source_total != output_total:
             raise 输入错误(f'{kind} 清洗前后金额不一致，停止交付。')
         for field,a,b in zip(原金额[kind],source_total,output_total):
             checks.append((kind,field,a,b,a-b,'清洗前后一致'))
         for pos,amount in book.合计:
-            if amount != source_total:
+            if any(v is not None and v!=actual for v,actual in zip(amount,source_total,strict=True)):
                 warnings.append((kind,str(pos),'','源表合计行和明细合计不同，建议检查源表范围'))
         warnings.extend((kind,str(pos),'',f'{reason}：{text}') for pos,reason,text in book.警示)
     differences, auxiliary, bank_links = [], [], []
@@ -700,9 +738,9 @@ def main():
         raise 输入错误('样例行数应在1至200之间。')
     if args.公司标识 is not None and not 有值(args.公司标识):
         raise 输入错误('请使用有效的本批公司标识。')
-    period = args.余额期间
-    if period is not None and (not 期间格式.fullmatch(period) or period[:7] > period[8:]):
-        raise 输入错误('余额期间须为从早到晚的起止月份，例如 2025-01~2025-12。')
+    for period in (args.余额期间,args.序时期间):
+        if period is not None and (not 期间格式.fullmatch(period) or period[:7] > period[8:]):
+            raise 输入错误('会计期间须为从早到晚的起止月份，例如 2025-01~2025-12。')
     if len({file.resolve() for _,file,_ in inp}) != len(inp):
         raise 输入错误('同一文件重复提交。')
     for _,file,_ in inp:
@@ -720,38 +758,57 @@ def main():
     for kind,file,sheet in inp:
         plan = layouts.get(file.name)
         selected_sheet = sheet or args.工作表
-        native = None if plan else 读鼎信诺(file,selected_sheet,args.表头扫描行数,args.金额小数位)
+        native = None if plan else 读鼎信诺(file,selected_sheet,args.表头扫描行数,args.金额小数位,overrides,assigned)
         if native is None and file.suffix.casefold() not in ('.xlsx','.xlsm'):
             raise 输入错误(f'{file.name} 无法自动识别旧版账表。请查看原表结构，或另存为新版 Excel 后用版式方案适配。')
-        book = native or 读表(file,kind,selected_sheet,args.表头扫描行数,overrides,assigned,args.金额小数位,plan)
+        book = native or 读表(file,kind,selected_sheet,args.表头扫描行数,overrides,assigned,args.金额小数位,plan,args.公司标识)
         if kind and book.类别 != kind:
             raise 输入错误(f'{file.name} 实际识别为{book.类别}，与指定的{kind}不同。')
         if book.类别 in seen:
             raise 输入错误(f'{seen[book.类别]} 和 {file.name} 都识别为{book.类别}，请确认使用哪份。')
         seen[book.类别] = file.name
-        if native and args.公司标识:
+        if args.公司标识:
             for row in book.行:
                 if row.编码[0] != '本批账套' and 规范(row.编码[0]) != 规范(args.公司标识):
                     raise 输入错误(f'{row.位置} 公司标识与确认的本批账套不一致。')
                 row.编码 = (args.公司标识,*row.编码[1:])
-        if native and period and book.类别 in ('余额表','核算项目余额表'):
+        is_balance = book.类别 in ('余额表','核算项目余额表')
+        period = args.余额期间 if is_balance else args.序时期间
+        if period:
             if book.期间 and book.期间 != period:
                 raise 输入错误(f'{book.文件} 的原表期间 {book.期间} 与指定期间 {period} 不一致。')
             if not book.期间:
                 book.警示.append((位置(book.文件,book.页,book.表头),'源表未标注期间',f'本次按已核实的 {period} 处理'))
                 book.期间 = period
                 for row in book.行:
-                    row.年份 = period[:4] if period[:4] == period[8:12] else ''
-        if native and book.类别 == '余额表' and '末级' not in book.字段:
+                    if is_balance:
+                        row.年份 = period[:4] if period[:4] == period[8:12] else ''
+            if not is_balance:
+                核实分录日期(book.行,period)
+        if book.类别 == '余额表' and (native or any(r.科目级次 is not None for r in book.行)):
+            if not native:
+                graded = {(r.编码[0],r.编码[3]) for r in book.行 if r.科目级次 is not None}
+                for row in book.行:
+                    key = row.编码[0],row.编码[3]
+                    row.行类型 = '辅助明细' if row.科目级次 is None and key in graded else '科目汇总'
+            originally_leaf = {id(row) for row in book.行 if row.末级}
             标记上级(book.行)
+            if native and '末级' in book.字段:
+                for row in book.行:
+                    if not row.末级 and id(row) in originally_leaf:
+                        book.警示.append((row.位置,'末级标识与下级科目冲突','按原级次出表，核对总额只计下级'))
+            if not native:
+                accounts = [r for r in book.行 if r.行类型=='科目汇总']
+                book.控制合计 = 汇总((row for row in accounts if row.末级),4)
+                controls = {(r.编码[0],r.编码[3]):r for r in accounts}
+                if len(controls)==len(accounts):
+                    核对上级(book,controls)
         if book.类别 in 辅助表:
             supplements[book.类别] = book
         else:
             books.append(book)
     if not books:
         raise 输入错误('只识别到了核算项目表，请补充相应的序时账或科目余额表。')
-    if period and not any(b.类别 == '余额表' and b.补充核对 is not None for b in books):
-        raise 输入错误('余额期间参数适用于鼎信诺科目余额表，其他源表可在版式方案里填写会计期间。')
     exact,user_rules = 载入规则(args.科目规则)
     roots = 一级科目资料(books)
     rules,names,catalog = 账户规则(books,exact,user_rules,roots,维度资料(books,supplements))

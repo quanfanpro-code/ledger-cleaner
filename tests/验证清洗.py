@@ -27,7 +27,7 @@ class 清洗行为(unittest.TestCase):
         book.active.title = '封面'
         sheet = book.create_sheet('任意凭证页')
         sheet.merge_cells('A2:H2')
-        sheet['A2'] = '导出记录'
+        sheet['A2'] = '导出记录 2025年1月至1月'
         for region, value in [('A6:B6','本位币'),('C6:C7','会计日期'),('D6:D7','凭证编号'),
                               ('E6:E7','账户组合编码'),('F6:F7','账户说明'),('G6:G7','摘要'),
                               ('H6:H7','科目名称'),('I6:I7','行号')]:
@@ -277,14 +277,17 @@ class 清洗行为(unittest.TestCase):
             table_rows[2].insert(0,['2025年1月至1月'])
             table_rows[3].insert(0,['2025年1月至1月'])
         paths = [self.work / f'随机文件{i}.xls' for i in range(4)]
-        for path, rows in zip(paths, table_rows, strict=True):
+        for index,(path, rows) in enumerate(zip(paths, table_rows, strict=True)):
+            if index<2:
+                rows.insert(0,['2025年1月至1月'])
+            rows.insert(0,['公司名称：模拟公司'])
             with path.open('w', encoding='gb18030', newline='') as file:
                 csv.writer(file, delimiter='\t').writerows(rows)
         return paths
 
     def test_鼎信诺四表按内容识别维度及金额层级(self):
         paths = self.make_ding()
-        result = self.run_skill(files=paths[::-1])
+        result = self.run_skill(files=paths[::-1],optional=('--余额期间','2025-01~2025-01'))
         journal = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
         balance = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
         self.assertEqual(len(journal), 3)
@@ -324,13 +327,67 @@ class 清洗行为(unittest.TestCase):
         self.assertEqual(rows[3][3],'甲供应商')
         self.assertEqual([row[8] for row in rows[1:]],[-70,-70,-70])
 
+    def test_鼎信诺省略全零行并保留非零明细的上级科目(self):
+        columns = ('科目编号','科目名称','借贷方向','是否明细科目','科目级次',
+                   '账面期初数','账面借方发生额','账面贷方发生额','账面期末数')
+        book = Workbook()
+        sheet = book.active
+        sheet.append(columns)
+        for row in (
+            ('1002','银行存款','借','否',1,0,0,0,0),
+            ('100201','银行存款-人民币','借','是',2,0,0,0,0),
+            ('1122','应收账款','借','否',1,0,0,0,0),
+            ('112201','应收账款-货款','借','是',2,0,10,10,0),
+            ('112202','应收账款-服务费','借','是',2,0,-10,-10,0),
+            ('2202','应付账款','贷','否',1,0,0,0,0),
+            ('220201','应付账款-货款','贷','是',2,0,0,0,0),
+        ):
+            sheet.append(row)
+        book.save(self.balance)
+        book = Workbook()
+        sheet = book.active
+        sheet.append((*columns,'核算项目类型名称','核算项目编号','核算项目名称'))
+        for amount,code,name in ((12,'S01','甲供应商'),(-12,'S02','乙供应商'),(0,'S03','无金额供应商')):
+            sheet.append(('220201','应付账款-货款','贷','是',2,amount,0,0,amount,'供应商',code,name))
+        aux = self.work/'辅助余额.xlsx'
+        book.save(aux)
+        result = self.run_skill(files=[self.balance,aux],optional=('--公司标识','模拟公司','--余额期间','2025-01~2025-01'))
+        rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertEqual([(r[0],r[-1]) for r in rows[1:]],
+                         [('1122',1),('112201',2),('112202',2),('2202',1),('220201',2),('220201',None),('220201',None)])
+        self.assertEqual([r[6:8] for r in rows[2:4]],[(10,10),(-10,-10)])
+        self.assertEqual([r[3] for r in rows[-2:]],['甲供应商','乙供应商'])
+        trace = self.load_rows(result/'清洗核对.xlsx','余额表来源')
+        self.assertTrue(all(r[-1] is None for r in trace[1:] if r[5] in ('1002','100201') or r[9]=='无金额供应商'))
+        self.assertEqual([r[-1] for r in trace[1:] if r[5]=='1122'],[2])
+        check = self.load_rows(result/'清洗核对.xlsx','金额核对')
+        self.assertTrue(all(r[4]==0 for r in check[1:]))
+
+    def test_分列余额全零时仍输出表头和来源(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(('科目编号','科目名称','借方','贷方','期初','期末','公司编码'))
+        sheet.append(('1001010101','库存现金-人民币',0,0,0,0,'001'))
+        book.save(self.balance)
+        result = self.run_skill(files=[self.balance])
+        rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0][-1],'科目级次')
+        trace = self.load_rows(result/'清洗核对.xlsx','余额表来源')
+        self.assertEqual(len(trace),2)
+        self.assertIsNone(trace[1][-1])
+
     def test_鼎信诺重复候选时禁止猜测分录归属(self):
         paths = self.make_ding()
         with paths[0].open('a', encoding='gb18030', newline='') as f:
             csv.writer(f, delimiter='\t').writerow(
                 ['2025-01-05','0007','记','02','材料货款','220201','应付账款-货款',0,100])
-        failure = self.run_skill(False, paths)
-        self.assertIn('无法唯一匹配', failure)
+        result = self.run_skill(files=paths[:2])
+        rows = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
+        self.assertEqual(len(rows),4)
+        self.assertFalse(any('甲供应商' in str(r[9]) for r in rows[1:]))
+        audit = self.load_rows(result/'清洗核对.xlsx','辅助匹配')
+        self.assertTrue(any('原表未区分分录' in r[0] and '甲供应商' in r for r in audit[1:]))
 
     def test_鼎信诺空辅助余额只恢复已知发生额(self):
         result = self.run_skill(files=self.make_ding(empty_balance=True),optional=('--公司标识','模拟公司'))

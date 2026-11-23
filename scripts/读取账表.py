@@ -40,10 +40,10 @@ def 有值(value):
     '科目名称': '科目段|科目名称|会计科目名称|科目说明|natural account description',
     '一级编码': '一级编码|一级科目编码|一级科目编号',
     '一级科目': '一级科目|一级科目名称|一级科目说明',
-    '日期': '有效日期|记账日期|凭证日期|会计日期|业务日期|日期|effective date|accounting date|journal date',
+    '日期': '有效日期|记账日期|记账时间|凭证日期|会计日期|业务日期|日期|effective date|accounting date|journal date',
     '凭证号': '凭证号|凭证号码|凭证编号|凭证序号|journal number|voucher number',
-    '摘要': '行摘要|分录摘要|摘要|分录说明|凭证摘要|line description|journal line description',
-    '凭证类型': '凭证类型|凭证类别|凭证字|journal category|voucher type',
+    '摘要': '行摘要|分录摘要|业务说明|摘要|分录说明|凭证摘要|line description|journal line description',
+    '凭证类型': '凭证类型|凭证种类|凭证类别|凭证字|journal category|voucher type',
     '行号': '行号|分录行号|凭证行号|line number',
     '期间': '期间|会计期间|记账期间|会计月份|period|accounting period',
     '公司': '公司段|公司名称|记账公司|公司|company description',
@@ -78,6 +78,7 @@ def 有值(value):
     '期初贷方': '期初贷方|期初余额贷方|期初余额贷方金额|期初贷方余额|opening credit',
     '期末借方': '期末借方|期末余额借方|期末余额借方金额|期末借方余额|closing debit',
     '期末贷方': '期末贷方|期末余额贷方|期末余额贷方金额|期末贷方余额|closing credit',
+    '方向': '借贷方向|余额方向',
 }
 字段 = {key: {规范(x) for x in names.split('|')} for key, names in 字段.items()}
 公共 = {'借方', '贷方'}
@@ -128,11 +129,11 @@ class 行:
     行类型: str = ''
     末级: bool = True
     科目级次: int | None = None
-    鼎信诺键: tuple = ()
     借贷方向: str = ''
     辅助记录: tuple = ()
     辅助分项: tuple = ()
     币种: str = ''
+    来源位置: tuple = ()
 
 
 @dataclass
@@ -290,15 +291,31 @@ def 必需字段(kind, fields):
     return required
 
 
+def 币种表头(grid, end, col):
+    for row in reversed(grid[max(0,end-5):end]):
+        label = 规范(row[col]) if col < len(row) else ''
+        if '本位币' in label or 'accounted' in label:
+            return '本位币'
+        if any(term in label for term in ('原币','外币','交易币','entered','foreigncurrency')):
+            return '原币'
+    return ''
+
+
 def 匹配表头(kind, grid, extra, limits):
     best = None
     identity_aliases = 字段['组合'] | 字段['科目编码'] | extra.get('组合',set()) | extra.get('科目编码',set())
     for end in range(1, min(len(grid), limits) + 1):
+        if not any(v in identity_aliases or v in 字段['借方'] | 字段['贷方'] for v in grid[end-1]):
+            continue
         for start in range(max(0, end-4), end):
             block = grid[start:end]
             if not any(v in identity_aliases for row in block for v in row):
                 continue
             matches = 列候选(kind, block, extra)
+            for field in 金额字段 & matches.keys():
+                matches[field] = [(score + (4 if 币种表头(grid,end,col)=='本位币' else 0),col)
+                                  for score,col in matches[field] if 币种表头(grid,end,col)!='原币']
+            matches = {field:choices for field,choices in matches.items() if choices}
             required = 必需字段(kind, matches.keys())
             if not required <= matches.keys():
                 continue
@@ -362,7 +379,7 @@ def 定位表(path, book, kind, forced, limit, extra, layout):
     candidates = []
     aliases = 字段['组合'] | 字段['科目编码'] | extra.get('组合',set()) | extra.get('科目编码',set())
     for sheet in book.worksheets:
-        if forced and sheet.title != forced:
+        if (forced and sheet.title != forced) or (not forced and sheet.sheet_state != 'visible'):
             continue
         part = parts.get(sheet.title)
         if not part:
@@ -520,8 +537,8 @@ def 解析科目级次(value, loc):
 def 分列往来(title, val, identifier, position):
     direct = (identifier('往来编码'),文本(val('往来')))
     groups = (('个人',('职工','职员','员工','个人')),
-              ('供应商',('供应商','应付账款','预付账款')),
-              ('客户',('客户','应收账款','预收账款','合同负债','合同资产')))
+              ('供应商',('供应商','应付账款','应付票据','预付')),
+              ('客户',('客户','应收账款','应收票据','预收','合同负债','合同资产')))
     matches = [role for role,words in groups if any(word in title for word in words)]
     evidence = {key:(identifier(key+'编码'),文本(val(key))) for key,_ in groups}
     if any(有值(v) for v in direct):
@@ -565,8 +582,33 @@ def 表头期间(top_text):
         if match:
             a,b,c,d = match.groups()
             if 1 <= int(b) <= 12 and 1 <= int(d) <= 12:
-                return f'{a}-{int(b):02d}~{c or a}-{int(d):02d}'
+                period = f'{a}-{int(b):02d}~{c or a}-{int(d):02d}'
+                if period[:7] > period[8:]:
+                    raise 输入错误('报表起止月份顺序有误。')
+                return period
+    match = re.search(r'(?:会计期间|报告期间|账表期间|查询期间|起止月份)\s*[:：]?\s*((?:19|20)\d{2})(?:年|[-/])(\d{1,2})(?:月|\b)(?!\s*(?:至|到|[~～]))',top_text)
+    if match and 1 <= int(match[2]) <= 12:
+        month = f'{match[1]}-{int(match[2]):02d}'
+        return f'{month}~{month}'
     return ''
+
+
+def 核实分录日期(rows, period):
+    if period:
+        for row in rows:
+            if not period[:7] <= row.日期.strftime('%Y-%m') <= period[8:]:
+                raise 输入错误(f'{row.位置} 的日期不在注明的会计期间 {period} 内。')
+
+
+def 余额方向(direction, amounts, pos):
+    value = 规范(direction)
+    if value in ('贷','贷方','c','cr','credit'):
+        return '贷',(-amounts[0],amounts[1],amounts[2],-amounts[3])
+    if value in ('借','借方','d','dr','debit'):
+        return '借',amounts
+    if value in ('平','无','零','0','') and not (amounts[0] or amounts[3]):
+        return '平',amounts
+    raise 输入错误(f'{pos} 的余额方向「{文本(direction)}」无法确认。')
 
 
 def 分列数据(val, identifier, columns, company, position):
@@ -577,7 +619,7 @@ def 分列数据(val, identifier, columns, company, position):
         if 有值(code):
             parts[segment-1] = code
     if parts[0] == '0':
-        key = (names.get(1) or company) if '公司编码' not in columns else None
+        key = names.get(1) or company
         if not 有值(key):
             raise 输入错误(f'{position} 无法确认公司范围。请核对公司列或报表标题，在版式方案中给出已确认的公司标识。')
         parts[0] = key
@@ -598,19 +640,19 @@ def 分列数据(val, identifier, columns, company, position):
     return tuple(parts),names,lender,identifier('合同编码'),conflict
 
 
-def 读表(path, kind=None, forced=None, limit=120, extra=None, assigned=None, precision=2, layout=None):
+def 读表(path, kind=None, forced=None, limit=120, extra=None, assigned=None, precision=2, layout=None, company_hint=None):
     book = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     try:
-        return _读表(path, book, kind, forced, limit, extra or {}, assigned or {}, precision, layout or {})
+        return _读表(path, book, kind, forced, limit, extra or {}, assigned or {}, precision, layout or {},company_hint)
     finally:
         book.close()
 
 
-def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout):
+def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout,company_hint):
     kind, sheet, hit, merges, formulas, raw = 定位表(path, book, kind, forced, limit, extra, layout)
     _, end, matches, required = hit
     if '组合' in required:
-        matches = {key:value for key,value in matches.items() if key not in 分列专用字段}
+        matches = {key:value for key,value in matches.items() if key not in 分列专用字段 or key == '银行账号'}
     columns = {}
     assigned = assigned.get(kind, {})
     if layout and assigned:
@@ -620,6 +662,8 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
             raise 输入错误(f'{path.name} / {sheet.title}：「{field}」指定列超出表头范围或字段尚未识别。')
     for field, (_, choices) in matches.items():
         if field in assigned:
+            if field in 金额字段 and assigned[field] not in choices:
+                raise 输入错误(f'{path.name} / {sheet.title} 指定的「{field}」不是可用的同口径金额候选列。')
             columns[field] = assigned[field]
             continue
         if len(choices) != 1:
@@ -635,7 +679,11 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
             raise 输入错误(f'{path.name} / {sheet.title} 同时有带符号{base}与{base}借贷两列，请确认使用哪组。')
     split_layout = '组合' not in columns
     identity_field = '科目编码' if split_layout else '组合'
-    company = (layout.get('公司标识') or 表头公司(raw[:end])) if split_layout else ''
+    header_company = 表头公司(raw[:end]) if split_layout else ''
+    supplied = layout.get('公司标识') or company_hint
+    if header_company and supplied and 规范(header_company)!=规范(supplied):
+        raise 输入错误(f'{path.name} 的公司标识与表头不同。')
+    company = header_company or supplied
     width = max(max(columns.values())+1, min(12, max(map(len, raw))))
     rows, totals, warnings = [], [], []
     span_start = defaultdict(list)
@@ -657,12 +705,12 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
                               for key in used_amounts if columns[key] < len(row))
     if re.search(r'单位\s*[:：]?\s*(?:人民币\s*)?[万千百]元', top_text) or re.search(r'[万千百]元', amount_headers):
         raise 输入错误(f'{path.name} / {sheet.title} 的报表金额单位不是元，请确认如何换算后再处理。')
-    period = 表头期间(top_text) if kind == '余额表' else ''
+    period = 表头期间(top_text)
     plan_period = layout.get('会计期间','')
     if period and plan_period and period != plan_period:
         raise 输入错误(f'{path.name} / {sheet.title} 的表头会计期间与版式方案不一致。')
     period = plan_period or period
-    formula_watch = columns.keys() if split_layout else required | set(used_amounts) | ({'科目名称','描述','科目编码'} & columns.keys())
+    formula_watch = columns.keys()
     for number, cells in enumerate(sheet.iter_rows(min_row=end+1, max_col=width), end+1):
         pos = 位置(path.name, sheet.title, number)
         values = [cell.value for cell in cells]
@@ -686,7 +734,7 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
                 raise 输入错误(f'{pos} {get_column_letter(col+1)}{number} 的{key}公式没有已保存的计算结果。请在Excel重新计算并保存源文件。')
         identity = identifier(identity_field)
         if 规范(identity) in 字段[identity_field] | extra.get(identity_field, set()):
-            for key in required | set(used_amounts):
+            for key in columns:
                 col = columns[key]
                 names = 字段[key] | extra.get(key, set())
                 found = [i for i,cell in enumerate(values) if 规范(cell) in names]
@@ -715,6 +763,10 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
                 raise 输入错误(f'{pos} 有金额但无法确认科目编码：{identity or "空白"}。')
             raise 输入错误(f'{pos} 的账户组合无法识别，预期为10段编码：{identity or "空白"}。请先核对版式。')
         amounts = tuple(amount(key) for key in amount_keys)
+        if kind == '余额表' and '方向' in columns:
+            side,signed = 余额方向(val('方向'),amounts,pos)
+            amounts = (signed[0] if '期初' in columns else amounts[0],amounts[1],amounts[2],
+                       signed[3] if '期末' in columns else amounts[3])
         if split_layout:
             parts,names,lender,contract,conflict = 分列数据(val,identifier,columns,company,pos)
             row = 行(pos,parts,names,amounts,分列=True,贷款行=lender,合同=contract,
@@ -732,6 +784,11 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
                     warnings.append((pos, '分列名称与组合说明不同', f'第{seg}段采用分列：{name}，描述：{alternative}'))
                 names[seg] = name
             row = 行(pos,parts,names,amounts,原始组合=identity)
+            row.银行账号 = identifier('银行账号')
+            if 有值(row.银行账号) and 有值(names.get(5) or names.get(9)):
+                bank = names.get(5) or names[9]
+                names[5] = bank if 规范(bank).endswith(规范(row.银行账号)) else f'{bank} {row.银行账号}'
+                row.编码 = (*row.编码[:4],row.银行账号,*row.编码[5:])
         if kind == '序时账':
             row.日期 = 日期(val('日期'), book.epoch, pos)
             row.凭证 = identifier('凭证号')
@@ -741,7 +798,7 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
             row.类型 = 文本(val('凭证类型'))
             row.期间 = 文本(val('期间')) or row.日期.strftime('%Y-%m')
             row.年份 = str(row.日期.year)
-            row.行号 = 文本(val('行号'))
+            row.行号 = identifier('行号')
             row.一级编码 = identifier('一级编码')
             row.一级科目 = 文本(val('一级科目'))
         else:
@@ -751,7 +808,6 @@ def _读表(path, book, kind, forced, limit, extra, assigned, precision, layout)
     if not rows:
         raise 输入错误(f'{path.name} / {sheet.title} 找到表头，但没有可转换的账户明细。')
     if kind == '序时账':
-        periods = sorted({row.日期.strftime('%Y-%m') for row in rows})
-        period = f'{periods[0]}~{periods[-1]}'
+        核实分录日期(rows,period)
     method = '版式方案' if layout else ('分列自动识别' if split_layout else '账户组合自动识别')
     return 表(kind, path.name, sheet.title, end, columns, rows, totals, period, warnings, method)
