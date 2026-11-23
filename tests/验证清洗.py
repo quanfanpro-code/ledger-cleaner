@@ -247,7 +247,7 @@ class 清洗行为(unittest.TestCase):
         self.assertEqual(rows[1][8:10],('B01','示例银行城东支行'))
         self.assertEqual(rows[2][8:10],(None,'贷款银行待核'))
 
-    def make_ding(self, empty_balance=False):
+    def make_ding(self, empty_balance=False, partial_balance=False, dated=False):
         journal = ['记账时间','凭证编号','凭证种类','编号','业务说明','科目编号','科目名称','借方发生额','贷方发生额']
         balance = ['科目编号','科目名称','借贷方向','是否明细科目','科目级次','账面期初数','账面借方发生额','账面贷方发生额','账面期末数']
         aux = ['核算项目类型名称','核算项目编号','核算项目名称']
@@ -268,6 +268,14 @@ class 清洗行为(unittest.TestCase):
         if empty_balance:
             table_rows[2].insert(0,['2025年1月至1月'])
             table_rows[3] = [['2025年1月至1月'], table_rows[3][0]]
+        if partial_balance:
+            table_rows[1].pop(2)  # 只登记了其中一笔供应商分配，剩余金额仍应能对回科目。
+            table_rows[3] = [table_rows[3][0],
+                             ['1002','银行存款','借','是',1,5,100,0,105,'银行账户','0008','示例银行00008888'],
+                             table_rows[3][-1]]
+        if dated:
+            table_rows[2].insert(0,['2025年1月至1月'])
+            table_rows[3].insert(0,['2025年1月至1月'])
         paths = [self.work / f'随机文件{i}.xls' for i in range(4)]
         for path, rows in zip(paths, table_rows, strict=True):
             with path.open('w', encoding='gb18030', newline='') as file:
@@ -305,6 +313,27 @@ class 清洗行为(unittest.TestCase):
         self.assertIn(('220201','应付账款-货款',None,'未列明辅助项目',-25,None,0,0,-25,None,'未列明辅助项目'),rows)
         logs = self.load_rows(result/'清洗核对.xlsx','辅助匹配')
         self.assertTrue(any(row[0] == '仅分配序时账已知发生额，期初未分配' for row in logs))
+
+    def test_鼎信诺逐科目补入缺失辅助而保留其他科目的原余额(self):
+        result = self.run_skill(files=self.make_ding(partial_balance=True,dated=True),optional=('--公司标识','模拟公司'))
+        rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertIn(('1002','银行存款','0008','示例银行00008888',5,None,100,0,105,None,'辅助明细'),rows)
+        self.assertIn(('220201','应付账款-货款','0001','甲供应商',0,None,0,60,-60,None,'辅助明细'),rows)
+        self.assertIn(('220201','应付账款-货款',None,'未列明辅助项目',-25,None,0,40,-65,None,'未列明辅助项目'),rows)
+        self.assertFalse(any(row[3] in ('采购部','乙供应商') for row in rows[1:]))
+
+    def test_鼎信诺缺辅助余额文件可用确认期间补入辅助(self):
+        paths = self.make_ding()
+        result = self.run_skill(files=paths[:3],optional=('--公司标识','模拟公司','--余额期间','2025-01~2025-01'))
+        rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertIn(('220201','应付账款-货款','0002','乙供应商',0,None,0,40,-40,None,'辅助明细'),rows)
+        self.assertIn(('220201','应付账款-货款',None,'未列明辅助项目',-25,None,0,0,-25,None,'未列明辅助项目'),rows)
+
+    def test_鼎信诺原余额期间与指定冲突时报明位置(self):
+        failure = self.run_skill(False,self.make_ding(partial_balance=True,dated=True),
+                                 ('--公司标识','模拟公司','--余额期间','2025-02~2025-02'))
+        self.assertIn('原表期间',failure)
+        self.assertIn('随机文件2.xls',failure)
 
     def test_鼎信诺新版工作簿用合并表头辨认本位币(self):
         book = Workbook()

@@ -603,6 +603,8 @@ def 整理分录(journal, extra, rules, names):
                 row.合同 = contract
         if not selected:
             continue
+        if len({规范(item.辅助记录[0]) for item in selected}) > 1:
+            raise 输入错误(f'{row.位置} 有多个符合规则的辅助维度，请确认应使用哪一项。')
         objects = sorted({(item.辅助记录[1],item.辅助记录[2]) for item in selected})
         warning = '辅助明细只覆盖部分分录金额，分项金额见辅助匹配' if 汇总(selected,2) != row.金额 else ''
         if len(objects) == 1:
@@ -627,9 +629,12 @@ def 整理余额(balance, extra, journal, journal_parts, rules, names):
     核对上级(balance,controls)
     output = []
     by_account = defaultdict(list)
-    if journal and extra is not None and not extra.行 and balance.期间 and journal.期间 == balance.期间:
+    period_matches = (journal and journal.期间 and balance.期间
+                      and balance.期间[:7] <= journal.期间[:7] <= journal.期间[8:] <= balance.期间[8:])
+    if period_matches:
         for row in journal.行:
             by_account[(row.编码[0],row.编码[3])].append(row)
+    candidate_codes = {code for _,code in journal_parts}
     balance.控制合计 = 汇总((row for row in controls.values() if row.末级),4)
     for key,base in controls.items():
         rule = rules[key[1]]
@@ -647,17 +652,19 @@ def 整理余额(balance, extra, journal, journal_parts, rules, names):
             记录(balance,status,base,item)
             if keep:
                 selected.append(item)
-        if not items and key in by_account and key[0] != '本批账套':
-            jparts = journal_parts[key]
+        if not selected and key[1] in candidate_codes:
+            jparts = journal_parts.get(key,())
             opening,debit,credit,closing = base.金额
-            complete = all(tuple(sum(part[i] for _,_,part in row.辅助分项) for i in range(2)) == row.金额
-                           for row in by_account[key])
-            if (complete and jparts and 汇总(by_account[key],2) == (debit,credit) and 汇总(jparts,2) == (debit,credit)
-                and opening+debit-credit == closing):
+            if not period_matches or not jparts or key[0] == '本批账套':
+                balance.警示.append((base.位置,'序时账辅助待补录','已找到同科目辅助分录，请先核实公司和余额表的起止月份'))
+            elif 汇总(by_account[key],2) != (debit,credit) or opening+debit-credit != closing:
+                balance.警示.append((base.位置,'序时账辅助待补录','借贷发生额未逐项对上，或科目期初加借减贷与期末不一致'))
+            else:
                 for item in jparts:
                     d,c = item.金额
                     selected.append(replace(item,金额=(0,d,c,d-c)))
                     记录(balance,'仅分配序时账已知发生额，期初未分配',base,selected[-1])
+                balance.警示.append((base.位置,'已补入本期辅助项目','项目期末仅列可确认的净变动，未知期初和未归属发生额另列'))
         if not selected:
             # 科目名已说明的分类仍可直接显示在汇总行，无源辅助维度由共用规则标记。
             base.辅助指定 = None

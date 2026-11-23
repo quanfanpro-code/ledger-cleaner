@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 原金额 = {'序时账': ('借方发生额','贷方发生额'), '余额表': ('期初净额','借方发生额','贷方发生额','期末净额')}
 金额列 = {'序时账': (6,7), '余额表': (4,6,7,8)}
 可选来源 = {1,3,5,6,7,8,9,'loan','interest','year','literal','currency'}
+期间格式 = re.compile(r'\d{4}-(?:0[1-9]|1[0-2])~\d{4}-(?:0[1-9]|1[0-2])')
 
 
 def 准备参数():
@@ -42,6 +43,7 @@ def 准备参数():
     p.add_argument('--序时账工作表')
     p.add_argument('--余额表工作表')
     p.add_argument('--公司标识', help='账套未标注时使用已经确认的本批公司标识')
+    p.add_argument('--余额期间', help='鼎信诺余额表未标注期间时，使用已核实的起止月份，例如 2025-01~2025-12')
     p.add_argument('--输出目录', type=Path)
     p.add_argument('--预检', action='store_true', help='识别、对账并报告歧义，不生成结果文件')
     p.add_argument('--科目规则', type=Path, help='用户确认后的额外科目规则文件')
@@ -160,7 +162,7 @@ def 载入版式(file, input_names):
         if '会计期间' in entry:
             period = entry['会计期间']
             if (kind != '余额表' or not isinstance(period,str) or
-                not re.fullmatch(r'\d{4}-(?:0[1-9]|1[0-2])~\d{4}-(?:0[1-9]|1[0-2])',period) or period[:7] > period[8:]):
+                not 期间格式.fullmatch(period) or period[:7] > period[8:]):
                 raise 输入错误(f'{name} 的余额表期间需要填写起止月份，例如 2025-01~2025-12。')
         result[name] = {**entry,'列':columns}
     return result
@@ -697,6 +699,9 @@ def main():
         raise 输入错误('样例行数应在1至200之间。')
     if args.公司标识 is not None and not 有值(args.公司标识):
         raise 输入错误('请使用有效的本批公司标识。')
+    period = args.余额期间
+    if period is not None and (not 期间格式.fullmatch(period) or period[:7] > period[8:]):
+        raise 输入错误('余额期间须为从早到晚的起止月份，例如 2025-01~2025-12。')
     if len({file.resolve() for _,file,_ in inp}) != len(inp):
         raise 输入错误('同一文件重复提交。')
     for _,file,_ in inp:
@@ -728,6 +733,14 @@ def main():
                 if row.编码[0] != '本批账套' and 规范(row.编码[0]) != 规范(args.公司标识):
                     raise 输入错误(f'{row.位置} 公司标识与确认的本批账套不一致。')
                 row.编码 = (args.公司标识,*row.编码[1:])
+        if native and period and book.类别 in ('余额表','核算项目余额表'):
+            if book.期间 and book.期间 != period:
+                raise 输入错误(f'{book.文件} 的原表期间 {book.期间} 与指定期间 {period} 不一致。')
+            if not book.期间:
+                book.警示.append((位置(book.文件,book.页,book.表头),'源表未标注期间',f'本次按已核实的 {period} 处理'))
+                book.期间 = period
+                for row in book.行:
+                    row.年份 = period[:4] if period[:4] == period[8:12] else ''
         if native and book.类别 == '余额表' and '末级' not in book.字段:
             标记上级(book.行)
         if book.类别 in 辅助表:
@@ -736,6 +749,8 @@ def main():
             books.append(book)
     if not books:
         raise 输入错误('只识别到了核算项目表，请补充相应的序时账或科目余额表。')
+    if period and not any(b.类别 == '余额表' and b.补充核对 is not None for b in books):
+        raise 输入错误('余额期间参数适用于鼎信诺科目余额表，其他源表可在版式方案里填写会计期间。')
     exact,user_rules = 载入规则(args.科目规则)
     roots = 一级科目资料(books)
     rules,names,catalog = 账户规则(books,exact,user_rules,roots,维度资料(books,supplements))
